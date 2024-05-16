@@ -7,17 +7,17 @@ const ChatRoom = () => {
 
   const fetchMessages = async () => {
     try {
-      const response = await fetch('http://localhost:5000/messages');
+      const response = await fetch('http://localhost:8080/messages');
       const data = await response.json();
       setMessages(data);
     } catch (error) {
-      console.error('Error fetching messages:', error);
+      console.log('Error fetching messages:', error);
     }
   };
 
   const sendMessage = async () => {
     try {
-      await fetch('http://localhost:5000/messages', {
+      await fetch('http://localhost:8080/messages', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -30,7 +30,7 @@ const ChatRoom = () => {
       // Fetch messages to update the list
       fetchMessages();
     } catch (error) {
-      console.error('Error sending message:', error);
+      console.log('Error sending message:', error);
     }
   };
 
@@ -44,7 +44,7 @@ const ChatRoom = () => {
 
     return () => clearInterval(interval);
   }, []); // Run only once on mount
-
+  console.log(messages);
   return (
     <div>
       <h2>Chat Room</h2>
