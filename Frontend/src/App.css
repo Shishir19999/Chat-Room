@@ -46,3 +46,9 @@ button:hover {
   background-color: #8ab6f9;
   color: #00246b;
 }
+
+.status { font-size: 0.9rem; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
+.error { color: #c0392b; }
+.typing { font-size: 0.85rem; font-style: italic; min-height: 1.2em; }
+.messages { max-height: 50vh; overflow-y: auto; }
