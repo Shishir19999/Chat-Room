@@ -1,227 +1,153 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { io } from 'socket.io-client';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Navigate, useNavigate, useParams } from 'react-router-dom';
+import { createClient, IS_DEMO } from './api/index.js';
+import { useChat } from './hooks/useChat.js';
+import { KEYS, readJson, writeJson } from './lib/storage.js';
+import { DEFAULT_ROOM, cleanRoom } from './lib/limits.js';
+import Sidebar from './components/Sidebar.jsx';
+import ChatHeader from './components/ChatHeader.jsx';
+import MessageList from './components/MessageList.jsx';
+import Composer from './components/Composer.jsx';
+import SearchPanel from './components/SearchPanel.jsx';
+import CreateRoomDialog from './components/CreateRoomDialog.jsx';
+import ConfirmDialog from './components/ConfirmDialog.jsx';
+import Dialog from './components/Dialog.jsx';
+import DemoBanner from './components/DemoBanner.jsx';
+import { useToast } from './components/Toasts.jsx';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
-const MAX_USER_LEN = 30;
-const MAX_MESSAGE_LEN = 500;
-const MAX_ROOM_LEN = 30;
-const PAGE_SIZE = 50;
-
-const cleanRoom = (v) => v.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, MAX_ROOM_LEN) || 'general';
-
-// Note: React escapes text rendered as JSX children, so message content is never injected as HTML.
-const ChatRoom = () => {
-  const [messages, setMessages] = useState([]);
-  const [user, setUser] = useState('');
-  const [message, setMessage] = useState('');
-  const [roomInput, setRoomInput] = useState('general');
-  const [room, setRoom] = useState(null); // joined room
-  const [status, setStatus] = useState('connecting'); // connecting | connected | reconnecting | disconnected
-  const [online, setOnline] = useState([]);
-  const [typingUsers, setTypingUsers] = useState([]);
-  const [error, setError] = useState('');
-  const [hasMore, setHasMore] = useState(false);
-  const [loadingOlder, setLoadingOlder] = useState(false);
-
-  const socketRef = useRef(null);
-  const joinRef = useRef(null); // { user, room } to rejoin after reconnect
-  const bottomRef = useRef(null);
-  const typingTimer = useRef(null);
-  const skipScroll = useRef(false); // do not jump to the bottom when older messages are prepended
-  const oldestId = useRef(null);
-
-  // Latest page of a room (also used to catch up after a reconnect).
-  const loadHistory = useCallback(async (r) => {
-    try {
-      const res = await fetch(`${API_URL}/messages?room=${encodeURIComponent(r)}&limit=${PAGE_SIZE}`);
-      const body = await res.json();
-      const data = Array.isArray(body.data) ? body.data : [];
-      setMessages(data);
-      setHasMore(Boolean(body.hasMore));
-      oldestId.current = data.length ? data[0]._id : null;
-    } catch (e) {
-      console.error('Error fetching messages:', e);
-    }
-  }, []);
-
-  // Cursor pagination: fetch messages older than the oldest one we hold.
-  const loadOlder = async () => {
-    if (!room || !oldestId.current || loadingOlder) return;
-    setLoadingOlder(true);
-    try {
-      const res = await fetch(`${API_URL}/messages?room=${encodeURIComponent(room)}&before=${oldestId.current}&limit=${PAGE_SIZE}`);
-      const body = await res.json();
-      const older = Array.isArray(body.data) ? body.data : [];
-      skipScroll.current = true;
-      setMessages((prev) => {
-        const seen = new Set(prev.map((m) => m._id));
-        return [...older.filter((m) => !seen.has(m._id)), ...prev];
-      });
-      setHasMore(Boolean(body.hasMore));
-      if (older.length) oldestId.current = older[0]._id;
-    } catch (e) {
-      console.error('Error fetching older messages:', e);
-    } finally {
-      setLoadingOlder(false);
-    }
-  };
+// Creates the client (real or demo) once, then renders the chat.
+export default function ChatRoom(props) {
+  const { room: param } = useParams();
+  const [client, setClient] = useState(null);
+  const [failed, setFailed] = useState(false);
+  const { user } = props;
 
   useEffect(() => {
-    const socket = io(API_URL, { reconnectionDelayMax: 5000 });
-    socketRef.current = socket;
+    if (!user) return undefined;
+    let cancelled = false;
+    createClient().then((c) => { if (!cancelled) setClient(c); }).catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; setClient(null); };
+  }, [user]);
 
-    socket.on('connect', () => {
-      setStatus('connected');
-      if (joinRef.current) {
-        socket.emit('join', joinRef.current);
-        loadHistory(joinRef.current.room); // catch up on anything missed while offline
-      }
-    });
-    socket.on('disconnect', () => setStatus('disconnected'));
-    socket.io.on('reconnect_attempt', () => setStatus('reconnecting'));
-    socket.on('connect_error', () => setStatus('reconnecting'));
+  if (!user) return <Navigate to="/" replace />;
+  const room = cleanRoom(param || DEFAULT_ROOM);
+  if (param && param !== room) return <Navigate to={`/chat/${room}`} replace />;
+  if (failed) {
+    return (
+      <main className="center-screen"><div className="state" role="alert"><h1>Could not start the chat</h1><p>Reload the page and try again.</p></div></main>
+    );
+  }
+  if (!client) return <main className="center-screen" aria-busy="true"><p className="muted">Loading chat...</p></main>;
+  return <ChatView {...props} client={client} room={room} />;
+}
 
-    socket.on('message', (msg) => {
-      setMessages((prev) => (prev.some((m) => m._id === msg._id) ? prev : [...prev, msg]));
-    });
-    socket.on('presence', ({ users }) => setOnline(users));
-    socket.on('typing', ({ user: who, typing }) => {
-      setTypingUsers((prev) => {
-        const without = prev.filter((u) => u !== who);
-        return typing ? [...without, who] : without;
-      });
-    });
-    socket.on('error_message', (m) => setError(m));
+function ChatView({ client, room, user, setUser, theme, onToggleTheme }) {
+  const navigate = useNavigate();
+  const { toast } = useToast();
+  const [soundOn, setSoundOn] = useState(() => readJson(KEYS.sound, false));
+  const chat = useChat({ client, user, room, soundOn });
+  const [menu, setMenu] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [replyTo, setReplyTo] = useState(null);
+  const [deleting, setDeleting] = useState(null);
+  const [viewing, setViewing] = useState(null);
+  const composer = useRef(null);
 
-    return () => {
-      socket.disconnect();
-    };
-  }, [loadHistory]);
-
-  // Auto-scroll to latest message
+  // Opening a room that does not exist yet creates it.
+  const { roomsPhase, rooms, createRoom } = chat;
+  const known = rooms.some((r) => r.name === room);
   useEffect(() => {
-    if (skipScroll.current) {
-      skipScroll.current = false;
-      return;
-    }
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    if (roomsPhase === 'ready' && !known) createRoom({ name: room, description: '' }).catch(() => {});
+  }, [roomsPhase, known, room, createRoom]);
 
-  const join = async (e) => {
-    e.preventDefault();
-    const name = user.trim().slice(0, MAX_USER_LEN);
-    if (!name) {
-      setError('Please enter a name');
-      return;
-    }
-    const r = cleanRoom(roomInput);
-    setError('');
-    setTypingUsers([]);
-    joinRef.current = { user: name, room: r };
-    setUser(name);
-    // Join first and only show the room once history is loaded, so a message can't be sent before the server knows our room.
-    socketRef.current.emit('join', joinRef.current);
-    await loadHistory(r);
-    setRoom(r);
+  const [shownRoom, setShownRoom] = useState(room);
+  if (shownRoom !== room) {
+    setShownRoom(room);
+    setReplyTo(null);
+    setSearching(false);
+    setMenu(false);
+  }
+  useEffect(() => { document.title = `#${room} - Chat Room`; return () => { document.title = 'Chat Room'; }; }, [room]);
+
+  const toggleSound = () => {
+    setSoundOn((v) => { writeJson(KEYS.sound, !v); return !v; });
   };
 
-  const leave = () => {
-    socketRef.current.emit('leave');
-    joinRef.current = null;
-    setRoom(null);
-    setMessages([]);
-    setHasMore(false);
-    oldestId.current = null;
-    setOnline([]);
-    setTypingUsers([]);
+  const fail = useCallback((e) => toast(e.message || 'Something went wrong.', 'error'), [toast]);
+  const actions = {
+    loadOlder: () => chat.loadOlder().catch(fail),
+    reply: (m) => { setReplyTo(m); composer.current?.focus(); },
+    react: (m, emoji) => chat.react(m._id, emoji).catch(fail),
+    edit: (m, text) => chat.edit(m._id, text).catch((e) => { fail(e); throw e; }),
+    askDelete: setDeleting,
+    openImage: setViewing,
   };
 
-  const sendMessage = (e) => {
-    e.preventDefault();
-    const text = message.trim();
-    if (!text) return;
-    if (status !== 'connected') {
-      setError('Not connected. Please wait for reconnection.');
-      return;
-    }
-    socketRef.current.emit('message', { message: text.slice(0, MAX_MESSAGE_LEN) }, (res) => {
-      if (res && !res.ok) setError(res.error);
-    });
-    socketRef.current.emit('typing', false);
-    clearTimeout(typingTimer.current);
-    setError('');
-    setMessage('');
-  };
-
-  const onMessageChange = (e) => {
-    setMessage(e.target.value);
-    const s = socketRef.current;
-    if (!s || !room) return;
-    s.emit('typing', true);
-    clearTimeout(typingTimer.current);
-    typingTimer.current = setTimeout(() => s.emit('typing', false), 1500);
-  };
-
-  const statusLabel = {
-    connecting: 'Connecting...',
-    connected: 'Connected',
-    reconnecting: 'Reconnecting...',
-    disconnected: 'Disconnected',
-  }[status];
-  const statusColor = status === 'connected' ? '#1a9e4a' : status === 'disconnected' ? '#c0392b' : '#d68910';
+  const current = rooms.find((r) => r.name === room);
+  const offline = client.mode === 'real' && chat.status !== 'connected';
 
   return (
-    <div className="chat">
-      <h2>Chat Room</h2>
-      <p className="status">
-        <span className="dot" style={{ background: statusColor }} /> {statusLabel}
-      </p>
-      {error && <p className="error">{error}</p>}
-
-      {!room ? (
-        <form onSubmit={join} className="join">
-          <input type="text" placeholder="Your name" maxLength={MAX_USER_LEN} value={user} onChange={(e) => setUser(e.target.value)} />
-          <input type="text" placeholder="Room (default: general)" maxLength={MAX_ROOM_LEN} value={roomInput} onChange={(e) => setRoomInput(e.target.value)} />
-          <button type="submit">Join</button>
-        </form>
-      ) : (
-        <>
-          <p>
-            Room <strong>#{room}</strong> as <strong>{user}</strong> <button onClick={leave}>Leave</button>
-          </p>
-          <p className="online">Online ({online.length}): {online.join(', ')}</p>
-          <ul className="messages">
-            {hasMore && (
-              <li className="older">
-                <button type="button" data-testid="load-older" onClick={loadOlder} disabled={loadingOlder}>
-                  {loadingOlder ? 'Loading...' : 'Load older messages'}
-                </button>
-              </li>
+    <div className="app-shell">
+      {IS_DEMO && <DemoBanner client={client} />}
+      <div className="app-body">
+        <Sidebar
+          open={menu} onClose={() => setMenu(false)} chat={chat} room={room} user={user}
+          onLogout={() => { setUser(''); navigate('/'); }}
+          onNewRoom={() => { setMenu(false); setCreating(true); }}
+          theme={theme} onToggleTheme={onToggleTheme} soundOn={soundOn} onToggleSound={toggleSound}
+        />
+        <main className="chat" id="main">
+          <ChatHeader
+            room={room} description={current?.description} status={chat.status} online={chat.online} me={user}
+            onMenu={() => setMenu(true)} onSearch={() => setSearching((s) => !s)} searching={searching}
+            onMention={(u) => composer.current?.insert(`@${u}`)}
+          />
+          {searching ? (
+            <SearchPanel room={room} me={user} search={chat.search} onClose={() => setSearching(false)} />
+          ) : (
+            <MessageList chat={chat} room={room} me={user} actions={actions} />
+          )}
+          <div className="typing" aria-live="polite">
+            {chat.typing.length > 0 && (
+              <span><span className="typing-dots" aria-hidden="true"><i /><i /><i /></span>{chat.typing.join(', ')} {chat.typing.length > 1 ? 'are' : 'is'} typing</span>
             )}
-            {messages.map((m) => (
-              <li key={m._id}>
-                <strong>{m.user}:</strong> {m.message}
-              </li>
-            ))}
-            <div ref={bottomRef} />
-          </ul>
-          <p className="typing">
-            {typingUsers.length > 0 ? `${typingUsers.join(', ')} ${typingUsers.length > 1 ? 'are' : 'is'} typing...` : ' '}
-          </p>
-          <form onSubmit={sendMessage}>
-            <input
-              type="text"
-              placeholder="Type your message..."
-              maxLength={MAX_MESSAGE_LEN}
-              value={message}
-              onChange={onMessageChange}
-            />
-            <button type="submit" disabled={status !== 'connected'}>Send</button>
-          </form>
-        </>
+          </div>
+          <Composer
+            ref={composer} room={room} replyTo={replyTo} onCancelReply={() => setReplyTo(null)}
+            onSend={(payload) => chat.send(payload)} onTyping={chat.setTyping}
+            disabled={offline} offlineHint={offline ? 'You are offline. Messages can be sent again once reconnected.' : ''} onError={fail}
+          />
+        </main>
+      </div>
+
+      {creating && (
+        <CreateRoomDialog
+          onClose={() => setCreating(false)}
+          onCreate={async (input) => {
+            const created = await chat.createRoom(input);
+            setCreating(false);
+            toast(`Room #${created.name} created.`, 'success');
+            navigate(`/chat/${created.name}`);
+          }}
+        />
+      )}
+      {deleting && (
+        <ConfirmDialog
+          title="Delete this message?"
+          message="This cannot be undone. Everyone in the room will see it as deleted."
+          onCancel={() => setDeleting(null)}
+          onConfirm={async () => {
+            try { await chat.remove(deleting._id); toast('Message deleted.', 'success'); } catch (e) { fail(e); }
+            setDeleting(null);
+          }}
+        />
+      )}
+      {viewing && (
+        <Dialog title={`Image from ${viewing.user}`} onClose={() => setViewing(null)}>
+          <img className="viewer-image" src={viewing.image} alt={`Attachment from ${viewing.user}`} />
+        </Dialog>
       )}
     </div>
   );
-};
-
-export default ChatRoom;
+}
