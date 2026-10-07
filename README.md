@@ -10,22 +10,40 @@ Real-time chat: React (Vite) frontend + Express, Socket.IO and MongoDB backend.
 
 `CORS_ORIGIN` is a comma-separated list of allowed origins (default `http://localhost:5173`) used for both REST and Socket.IO.
 
+## Live demo
+
+https://shishir19999.github.io/Chat-Room/
+
+The hosted demo is static (no server, no database). It runs a simulated backend inside your browser.
+
+## Run modes
+
+- Full stack: Express + Socket.IO + MongoDB as in Setup. Real-time over WebSockets, data in MongoDB.
+- Browser-only demo: `cd Frontend && npm run dev:demo` (or set `VITE_DEMO=true`). Data lives in localStorage, tabs of the same browser stay in sync through BroadcastChannel, and simulated bot users reply, react and show typing indicators. A "Demo mode" banner offers "Reset demo data". Open two tabs to chat with yourself.
+- Static build for GitHub Pages: `cd Frontend && npm run build:pages` writes `Frontend/dist` (base `/Chat-Room/`, hash routing). Preview with `npm run preview:pages`.
+
 ## Features
 
-- Messages are saved to MongoDB and broadcast to the room over Socket.IO (no polling).
-- Named rooms (default `general`); online-user list per room; typing indicator.
-- Connection status indicator with automatic reconnect (history is reloaded after reconnect).
-- Validation: names max 30 chars, messages max 500 chars, trimmed. Text is rendered by React, which escapes it.
+- Rooms list with unread badges; create and join rooms.
+- Replies, emoji reactions, edit and delete your own messages, emoji picker.
+- Image paste or upload (resized, size-limited data URL).
+- @mention highlighting, message search, date separators, load older history (cursor pagination).
+- Typing and online indicators, connection status with automatic reconnect, optional notification sound.
+- Avatars with colors, light/dark theme (follows the system, remembered), responsive from 320px with a slide-over sidebar, skeletons, toasts, confirm dialogs, inline validation, 404 page.
+- Text is escaped by React; inputs are validated and uploads are size-limited.
+
+Parallax and scroll-reveal effects are used only on the landing/join hero and section backgrounds (never in the message list). They use only transform and opacity via IntersectionObserver and requestAnimationFrame, and are disabled for prefers-reduced-motion, small screens and low-power devices.
 
 ## API
 
-- `GET /messages?room=general` - last 100 messages of the room, oldest first
-- `POST /messages` - body `{ user, message, room? }` (also broadcast to the room)
+- `GET /messages?room=general&before=<id>&limit=30&q=text` - page of messages, oldest first, with `hasMore`
+- `POST /messages` - body `{ user, message, room?, image?, replyTo? }`
+- `GET /rooms`, `POST /rooms`, `POST /rooms/unread`
 
 ## Socket events
 
-Client to server: `join {user, room}`, `leave`, `message {message}` (ack `{ok, error}`), `typing boolean`.
-Server to client: `message`, `presence {room, users}`, `typing {room, user, typing}`, `joined`, `error_message`.
+Client to server: `join {user, room}`, `leave`, `message {message, image?, replyTo?}`, `edit {id, message}`, `delete {id}`, `react {id, emoji}` (acks `{ok, error}`), `typing boolean`.
+Server to client: `message`, `message_updated`, `presence`, `typing`, `activity`, `rooms_changed`, `joined`, `error_message`.
 
 ## Demo data
 `cd Backend && npm run seed` (idempotent, deterministic, database `chatroom`) inserts 400 messages over 6 rooms (`general` 90, `dev` 85, `random` 65, `design` 55, `support` 55, `music` 50) from 12 usernames (alice, bob, carol, dave, erin, frank, grace, heidi, ivan, judy, mallory, nina), spread over the 21 days before 2026-09-30. No login is needed; just pick any name.
