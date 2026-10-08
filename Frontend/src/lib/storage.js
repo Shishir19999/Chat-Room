@@ -16,9 +16,26 @@ export const removeKey = (key) => {
   try { localStorage.removeItem(key); } catch { /* ignore */ }
 };
 
+export const readSession = (key, fallback = '') => {
+  try { return sessionStorage.getItem(key) ?? fallback; } catch { return fallback; }
+};
+export const writeSession = (key, value) => {
+  try { if (value == null) sessionStorage.removeItem(key); else sessionStorage.setItem(key, value); } catch { /* ignore */ }
+};
+
 export const KEYS = {
-  user: 'chat:user',
+  profile: 'chat:profile',
   theme: 'chat:theme',
-  sound: 'chat:sound',
-  lastRead: (user) => `chat:lastread:${user}`,
+  accent: 'chat:accent',
+  rooms: 'chat:rooms',
+  secret: 'chat:secret',
+  uid: 'chat:uid',
+  tip: 'chat:dismissed',
+  pref: (name) => `chat:pref:${name}`,
+};
+
+// Preferences used by the engine (sound, blocked people, ...) live under chat:pref:*.
+export const prefs = {
+  get: (name, fallback) => readJson(KEYS.pref(name), fallback),
+  set: (name, value) => writeJson(KEYS.pref(name), value),
 };

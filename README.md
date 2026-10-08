@@ -1,90 +1,112 @@
 # Chat Room
 
-Real-time chat: React (Vite) frontend + Express, Socket.IO and MongoDB backend.
+A real-time chat room that feels like a modern messenger: live presence, typing indicators, read receipts, threads, reactions, voice notes, files, direct messages and private rooms. It starts from the original idea (type a name, join a shared room, talk) and layers a full product on top.
 
-## Setup
+It runs in two modes that share all of the UI and domain logic:
 
-1. `npm install` in `Backend` and `Frontend`.
-2. Copy `Backend/.env.example` to `Backend/.env` (`PORT`, `MONGODB_URL`, `CORS_ORIGIN`) and `Frontend/.env.example` to `Frontend/.env` (`VITE_API_URL`, must match the backend port).
-3. `npm run dev` in `Backend` (or `npm start`), then `npm run dev` in `Frontend`.
+| Mode | Where | How messages travel | Data lives in |
+| --- | --- | --- | --- |
+| **Peer-to-peer** (default for the static site) | GitHub Pages, any static host | Browser to browser over encrypted WebRTC | IndexedDB in each browser |
+| **Full stack** | Your own server or Docker | Socket.IO to an Express server | MongoDB |
 
-`CORS_ORIGIN` is a comma-separated list of allowed origins (default `http://localhost:5173`) used for both REST and Socket.IO.
+Live preview: https://shishir19999.github.io/Chat-Room/ (peer-to-peer, no server).
 
-## Live demo
+![Chat](docs/screenshots/chat-light.png)
 
-https://shishir19999.github.io/Chat-Room/
-
-The hosted demo is static (no server, no database). It runs a simulated backend inside your browser.
-
-## Run modes
-
-- Full stack: Express + Socket.IO + MongoDB as in Setup. Real-time over WebSockets, data in MongoDB.
-- Browser-only demo: `cd Frontend && npm run dev:demo` (or set `VITE_DEMO=true`). Data lives in localStorage, tabs of the same browser stay in sync through BroadcastChannel, and simulated bot users reply, react and show typing indicators. A "Demo mode" banner offers "Reset demo data". Open two tabs to chat with yourself.
-- Static build for GitHub Pages: `cd Frontend && npm run build:pages` writes `Frontend/dist` (base `/Chat-Room/`, hash routing). Preview with `npm run preview:pages`.
+| Landing | Dark theme | Thread | Phone |
+| --- | --- | --- | --- |
+| ![Landing](docs/screenshots/landing.png) | ![Dark](docs/screenshots/chat-dark.png) | ![Thread](docs/screenshots/thread.png) | ![Mobile](docs/screenshots/mobile.png) |
 
 ## Features
 
-- Rooms list with unread badges; create and join rooms.
-- Replies, emoji reactions, edit and delete your own messages, emoji picker.
-- Image paste or upload (resized, size-limited data URL).
-- @mention highlighting, message search, date separators, load older history (cursor pagination).
-- Typing and online indicators, connection status with automatic reconnect, optional notification sound.
-- Avatars with colors, light/dark theme (follows the system, remembered), responsive from 320px with a slide-over sidebar, skeletons, toasts, confirm dialogs, inline validation, 404 page.
-- Text is escaped by React; inputs are validated and uploads are size-limited.
+- **Identity**: pick a name and colour, optional status text. A stable identity (an ECDSA key pair) is created in your browser; your user id is its fingerprint.
+- **Rooms**: the public `lobby`, any named room, and password protected private rooms. Share an invite link (`#/join/<room>`, optionally with the password after the `#`). Channels inside a room, direct messages to anyone online, and small group chats (up to 8 people).
+- **Live presence** (online, idle, away), **typing indicators**, **delivery and seen receipts** (sent, delivered, seen by N), unread counters, mention badges, a "new messages" divider and "jump to first unread".
+- **Messages**: replies, threads, emoji reactions, edit and delete (with tombstones), pinned messages, search, load older history, date separators, grouping.
+- **Rich text** with Markdown (bold, italic, code, code blocks with a copy button, lists, quotes), link chips that show only the domain, `@mentions` with highlights and autocomplete, jumbo emoji.
+- **Emoji and stickers**: a bundled searchable emoji picker and sticker packs (no external service).
+- **Attachments**: pictures (resized), files up to 5 MB and voice notes (waveform and duration). Nothing from other people loads until you tap it.
+- **Notifications**: unread count in the tab title, optional sound, optional desktop notifications, screen reader announcements for new messages.
+- **Resilience**: connection status and quality indicator, an offline banner, automatic reconnection and history catch-up. Several tabs of one browser keep working through BroadcastChannel when nothing else is reachable.
+- **Safety**: per-sender rate limits, size caps, mute and block people, report and hide messages, optional family friendly word filter, strict sanitising of all content, and a notice that public rooms are visible to anyone.
+- **Design**: tokens, light and dark themes plus accent colours, fully responsive (phone first, slide-over sidebar), keyboard shortcuts (`Ctrl+K` switcher, `Esc`, `Up` to edit the last message, `Shift+Enter` for a new line), reduced motion support. Parallax and scroll-reveal are used only on the landing page.
+- **Practice bot**: in an empty room you can switch on a local helper to try every feature alone. It exists only on your device.
 
-Parallax and scroll-reveal effects are used only on the landing/join hero and section backgrounds (never in the message list). They use only transform and opacity via IntersectionObserver and requestAnimationFrame, and are disabled for prefers-reduced-motion, small screens and low-power devices.
+## Architecture
 
-## API
+```
+React UI  ->  ChatEngine (domain logic)  ->  Transport  ->  peers / server
+                    |                           |- p2p     (trystero over WebRTC)
+                    |                           |- socket  (Socket.IO)
+                    v                           |- memory  (tests)
+               Store (IndexedDB)
+```
 
-- `GET /messages?room=general&before=<id>&limit=30&q=text` - page of messages, oldest first, with `hasMore`
-- `POST /messages` - body `{ user, message, room?, image?, replyTo? }`
-- `GET /rooms`, `POST /rooms`, `POST /rooms/unread`
+- **Everything is an operation.** Messages, edits, deletes, reactions, pins, read markers, channel and group definitions are small immutable ops with an id, a hybrid logical clock (`lc`), a wall clock and an author. The state is a pure reducer over ops (`Frontend/src/core/state.js`): applying the same ops in any order, any number of times, gives the same result. Ordering is by clock, then wall time, then id; duplicates are ignored; edits and reactions that arrive before their message wait for it.
+- **Transport interface** (`Frontend/src/transport`): `join`, `leave`, `sendOp`, `sendEph` (typing, presence), `requestHistory`, `publishBlob` / `fetchBlob`, plus events for status, peers, ops and ephemeral messages. The UI and the engine never know which implementation runs.
+- **Peer-to-peer transport** uses [trystero](https://github.com/dmotz/trystero) (no accounts, no keys). Peers find each other through public relays (Nostr first; BitTorrent trackers and then MQTT brokers are tried if nobody is found or the relays are unreachable), then talk directly over encrypted WebRTC data channels. A room password feeds trystero's password option, so private rooms are not even discoverable without it. The connection status in the header shows the strategy, peer count and round-trip time.
+- **Signed ops.** In peer-to-peer mode each op is signed (ECDSA P-256) and the user id is the key fingerprint. Peers can therefore relay history for each other without being able to forge or change anyone's messages, and only the author can edit or delete a message.
+- **History in a serverless chat.** Every browser keeps the ops it has seen in IndexedDB. When a peer joins, both sides exchange a signed hello and then ask each other for ops newer than they have (private conversations are only served to their members). "Load older" first reads the local store, then asks peers.
+- **Socket mode** stores the same ops in MongoDB (`Op`, `Workspace`, `User`, `Upload`, `Report`). The server validates every op, checks authorship and membership, relays it and answers history requests. Protocol events live in one module, `Backend/events.js` (a verbatim copy sits in `Frontend/src/transport/socketEvents.js`; a test fails if they drift).
 
-## Socket events
+### Why peer-to-peer on a static site
 
-Client to server: `join {user, room}`, `leave`, `message {message, image?, replyTo?}`, `edit {id, message}`, `delete {id}`, `react {id, emoji}` (acks `{ok, error}`), `typing boolean`.
-Server to client: `message`, `message_updated`, `presence`, `typing`, `activity`, `rooms_changed`, `joined`, `error_message`.
+GitHub Pages has no server, so a normal chat server is impossible. WebRTC lets browsers talk directly; only the first handshake goes through public relays, and the chat data never touches them.
 
-## Demo data
-`cd Backend && npm run seed` (idempotent, deterministic, database `chatroom`) inserts 400 messages over 6 rooms (`general` 90, `dev` 85, `random` 65, `design` 55, `support` 55, `music` 50) from 12 usernames (alice, bob, carol, dave, erin, frank, grace, heidi, ivan, judy, mallory, nina), spread over the 21 days before 2026-09-30. No login is needed; just pick any name.
+### Limits of peer-to-peer
 
+- People must be online at the same time to exchange messages; there is no server to hold them. Messages you send while alone are kept on your device and delivered when someone connects.
+- History is per browser. Clearing site data removes it, and a new device starts empty (until peers send recent history).
+- Discovery relays are public infrastructure and can be down or blocked. Strict corporate networks or symmetric NATs may need a TURN server (`turnConfig` in `Frontend/src/transport/p2p.js`).
+- The browser must support WebRTC.
+- "Seen by" and "delivered" receipts are switched off for delivery in rooms with more than 12 connected peers.
 
-## Deploy with Docker
+## Safety notes
 
-Files: `Backend/Dockerfile`, `Frontend/Dockerfile` (Vite build served by nginx, SPA fallback in `Frontend/nginx.conf`), `.dockerignore` in both folders and `docker-compose.yml` here (mongo + backend + frontend).
+- Public rooms are visible to anyone on the internet. Do not share personal information (the app says so in public rooms).
+- All user content is escaped: Markdown is rendered with `marked`, sanitised with `DOMPurify` and then decorated; raw HTML is shown as text, images are never embedded, only `http(s)` and `mailto` links work and they show just the domain.
+- Peers cannot push oversized or malformed data: every op is validated, sizes are capped, senders are rate limited, and attachments are only fetched when you ask.
+- Mute, block and "report and hide" are local controls. In socket mode a report is also stored for the server owner.
+- Full-stack mode: salted scrypt password hashes, identity binding per user id, upload type checks by file signature, 5 MB limit, safe download headers, per-socket rate limits.
+
+## Setup
+
+Requirements: Node 24, MongoDB for full-stack mode.
 
 ```bash
-cp .env.example .env      # optional: set CORS_ORIGIN / ports
+# full stack
+cd Backend && npm install && cp .env.example .env     # PORT, MONGODB_URL, CORS_ORIGIN
+npm run dev
+cd Frontend && npm install && cp .env.example .env    # VITE_API_URL must match the backend port
+npm run dev
+
+# static peer-to-peer site (no backend)
+cd Frontend && npm run dev:demo         # development
+npm run build:pages                     # production build for GitHub Pages (base /Chat-Room/, hash routing)
+npm run preview:pages
+```
+
+Docker (MongoDB 8, Node 24 backend, nginx frontend):
+
+```bash
+cp .env.example .env     # optional: ports, CORS_ORIGIN, VITE_API_URL
 docker compose up --build -d
 ```
 
-- Frontend: http://localhost:8081 (`FRONTEND_PORT`), API: http://localhost:8080 (`BACKEND_PORT`). MongoDB is only reachable inside the compose network and its data lives in the `mongo-data` volume.
-- `VITE_API_URL` is baked into the frontend bundle at build time and must be the address the **browser** uses to reach the backend (for a server: `http://<server-ip-or-domain>:8080`); rebuild with `docker compose build frontend` after changing it.
-- `CORS_ORIGIN` must contain the origin the browser loads the frontend from (default `http://localhost:8081`); for a server use e.g. `http://<server-ip>:8081`.
-- Seed demo data: `docker compose exec backend npm run seed` fails in the production image because the seed uses a dev dependency (`@faker-js/faker`); run the seed from your machine instead: `cd Backend && MONGODB_URL=mongodb://127.0.0.1:27017/chatroom npm run seed` after temporarily publishing mongo (add `ports: ["27017:27017"]` to the `mongo` service).
-- The backend serves REST and Socket.IO on the same port; `CORS_ORIGIN` is used for both.
+## Scripts
 
-> Note: these Docker files were written and reviewed but not built or run in the authoring environment (Docker engine was off).
+| Where | Command | What it does |
+| --- | --- | --- |
+| Frontend | `npm run dev` / `dev:demo` | Vite dev server (full stack / peer-to-peer) |
+| Frontend | `npm run build` / `build:pages` | Production build (full stack / GitHub Pages) |
+| Frontend | `npm run lint` | ESLint, zero warnings allowed |
+| Frontend | `npm test` | Vitest: reducer, clock, dedupe, history, receipts, tombstones, rate limiter, sanitizer, signatures, IndexedDB store, engine over a mocked transport |
+| Backend | `npm start` / `npm run dev` | Run the server |
+| Backend | `npm test` | Node test runner against a throwaway MongoDB database |
+| Backend | `npm run seed` | Idempotent demo history for the lobby (about 400 messages) |
 
-## Open the app from a phone on the same Wi-Fi
+## Backend API
 
-1. Find the PC's LAN IP (`ipconfig` on Windows, look for the IPv4 address, e.g. `192.168.1.79`).
-2. Start the backend bound to all interfaces (the default `HOST=0.0.0.0`) with the phone's origin allowed, and Vite with `--host`:
-   ```bash
-   # Backend
-   CORS_ORIGIN=http://localhost:5173,http://192.168.1.79:5173 npm start
-   # Frontend: the API URL must use the LAN IP, not localhost
-   VITE_API_URL=http://192.168.1.79:8080 npm run dev -- --host 0.0.0.0 --port 5173
-   ```
-   (PowerShell: `$env:CORS_ORIGIN="..."; npm start`.)
-3. Allow the two ports through Windows Firewall (first run usually prompts; otherwise add an inbound rule for TCP 8080 and 5173, "Private" network only).
-4. On the phone (same network) open `http://192.168.1.79:5173`.
-
-Without `CORS_ORIGIN` set the API only accepts `http://localhost:5173`. If the phone shows the page but API calls fail, `VITE_API_URL` still points at `localhost` or the origin is missing from `CORS_ORIGIN`.
-
-## Tests
-
-`cd Backend && npm test` (node:test + supertest) runs against a throwaway local database that is dropped afterwards (set `TEST_MONGO_URI` to change the server, default `mongodb://127.0.0.1:27017`).
-
-## Message pagination
-`GET /messages?room=general&limit=50` returns `{ data, hasMore, nextBefore }` (data oldest to newest). Pass `before=<message id or ISO date>` to get the page of older messages; the UI has a "Load older messages" button. `limit` defaults to 50, max 100. (This replaces the old plain-array response.)
+- Socket.IO events: see `Backend/events.js` (`join`, `op`, `eph`, `history`, `report`, and `peer-join`, `peer-leave`, `op`, `eph` from the server).
+- `GET /rooms` public rooms with online counts, `GET /health`.
+- `POST /uploads` (multipart, bearer token from the join reply, 5 MB, signature checked) and `GET /uploads/:id`.

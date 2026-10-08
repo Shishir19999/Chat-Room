@@ -1,9 +1,11 @@
-// Idempotent seed: ~400 messages over 6 rooms by 12 usernames. Run with `npm run seed`.
-// Deterministic (faker seed 77, fixed reference date). Upserts by {room, user, timestamp}.
+// Idempotent seed: ~400 messages in the public lobby (channels general, random, dev, design, support, music)
+// from 12 usernames. Run with `npm run seed`. Deterministic (faker seed 77); upserts by operation id.
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import { faker } from '@faker-js/faker';
-import ChatMessage from '../models/ChatMessage.js';
+import { createHash } from 'node:crypto';
+import Op from '../models/Op.js';
+import Workspace from '../models/Workspace.js';
 
 dotenv.config();
 faker.seed(77);
@@ -28,40 +30,26 @@ const fill = (s) => s.replace('{x}', faker.helpers.arrayElement(topics))
   .replace('{s}', faker.helpers.arrayElement(statuses))
   .replace('{n}', String(faker.number.int({ min: 1000, max: 9999 })));
 
-const docs = [];
+const sha = (v) => createHash('sha256').update(v).digest('hex');
+const uidOf = (name) => sha(`seed-user:${name}`).slice(0, 16);
+const hueOf = (name) => parseInt(sha(name).slice(0, 4), 16) % 360;
+
+const ops = [];
 for (const [room, count] of Object.entries(rooms)) {
   const members = faker.helpers.shuffle(users).slice(0, room === 'general' ? 12 : 7);
   for (let i = 0; i < count; i++) {
-    // spread across the last 21 days; "- i" keeps timestamps unique per room
     const day = faker.number.int({ min: 0, max: 20 });
-    const ms = REF - day * DAY - faker.number.int({ min: 0, max: 9 * 3600 }) * 1000 - i;
-    docs.push({ room, user: faker.helpers.arrayElement(members), message: fill(faker.helpers.arrayElement(pools[room])), ts: new Date(ms) });
+    const ts = REF - day * DAY - faker.number.int({ min: 0, max: 9 * 3600 }) * 1000 - i;
+    const name = faker.helpers.arrayElement(members);
+    ops.push({ w: 'lobby', id: sha(`seed:${room}:${i}`).slice(0, 16), c: room, t: 'm', a: uidOf(name), lc: ts, ts, d: { text: fill(faker.helpers.arrayElement(pools[room])), n: name, col: hueOf(name) } });
   }
 }
-
-await mongoose.connect(process.env.MONGODB_URL || 'mongodb://127.0.0.1:27017/chatroom');
-// remove the legacy tiny seed conversation (relative timestamps) so it is not duplicated
-const legacy = [
-  ['general', 'alice', 'Hi everyone, welcome to the chat room!'],
-  ['general', 'bob', 'Hey Alice! Good to be here.'],
-  ['general', 'carol', 'Hello all. Is anyone working on the release today?'],
-  ['general', 'alice', 'Yes, I am finishing the final checks now.'],
-  ['general', 'bob', 'Great, ping me if you need a review.'],
-  ['dev', 'dave', 'Anyone seen the failing build on main?'],
-  ['dev', 'erin', 'Yes, it is a flaky test, re-running the pipeline.'],
-  ['dev', 'dave', 'Thanks, merging after it goes green.'],
-  ['random', 'bob', 'Coffee or tea?'],
-  ['random', 'carol', 'Coffee, always.'],
-];
-await ChatMessage.deleteMany({ $or: legacy.map(([room, user, message]) => ({ room, user, message, timestamp: { $gt: new Date(REF) } })) });
-let added = 0;
-for (const d of docs) {
-  const r = await ChatMessage.updateOne(
-    { room: d.room, user: d.user, timestamp: d.ts },
-    { $setOnInsert: { room: d.room, user: d.user, message: d.message, timestamp: d.ts, createdAt: d.ts, updatedAt: d.ts } },
-    { upsert: true, timestamps: false },
-  );
-  if (r.upsertedCount) added++;
+for (const room of Object.keys(rooms).filter((r) => !['general', 'random'].includes(r))) {
+  ops.push({ w: 'lobby', id: sha(`seed:channel:${room}`).slice(0, 16), c: room, t: 'ch', a: uidOf('alice'), lc: REF - 30 * DAY, ts: REF - 30 * DAY, d: { name: room, topic: '' }, k: `ch:${room}` });
 }
-console.log(`Seed done: ${added} new messages (total: ${await ChatMessage.countDocuments()}) in "${mongoose.connection.name}".`);
+
+await mongoose.connect(process.env.MONGODB_URL);
+await Workspace.updateOne({ name: 'lobby' }, { $setOnInsert: { name: 'lobby', isPrivate: false } }, { upsert: true });
+const result = await Op.bulkWrite(ops.map((op) => ({ updateOne: { filter: { w: op.w, id: op.id }, update: { $setOnInsert: op }, upsert: true } })));
+console.log(`Seeded ${result.upsertedCount} new operations (${ops.length} total) into the lobby.`);
 await mongoose.disconnect();

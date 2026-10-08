@@ -1,51 +1,71 @@
-/* eslint-disable react-refresh/only-export-components */
 import { useEffect, useRef, useState } from 'react';
+import { EMOJI_CATEGORIES, STICKER_PACKS, searchEmoji } from '../core/emoji.js';
+import Icon from './Icon.jsx';
 
-export const QUICK_REACTIONS = ['👍', '❤️', '😂', '🎉', '😮', '🙏'];
-
-const CATEGORIES = [
-  { id: 'smileys', label: 'Smileys', icon: '😀', items: '😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 🙃 😉 😍 🥰 😘 😋 😎 🤩 🥳 😏 😌 😴 🤔 🫡 😬 🙄 😢 😭 😤 😡 🥺 😱 🤯'.split(' ') },
-  { id: 'people', label: 'People', icon: '👋', items: '👋 🤚 ✋ 👌 ✌️ 🤞 🤟 🤘 👍 👎 👏 🙌 🙏 💪 🫶 ❤️ 🧡 💛 💚 💙 💜 🖤 💔 ✨ 🔥 💯 💬 👀'.split(' ') },
-  { id: 'nature', label: 'Nature', icon: '🌱', items: '🐶 🐱 🦊 🐼 🐨 🦁 🐸 🐵 🦄 🐝 🦋 🐢 🐙 🌱 🌳 🌸 🌻 🌈 ☀️ 🌙 ⭐ ⚡ ❄️ 🌊'.split(' ') },
-  { id: 'food', label: 'Food', icon: '🍕', items: '🍎 🍌 🍓 🍇 🍉 🥑 🌽 🍕 🍔 🌮 🍣 🍜 🍩 🍪 🎂 🍫 🍿 ☕ 🍵 🍺 🍷'.split(' ') },
-  { id: 'activity', label: 'Activity', icon: '🎮', items: '⚽ 🏀 🎾 🎯 🎮 🎲 🎸 🎧 🎤 🎬 🎨 📚 🚀 ✈️ 🚗 🏆 🥇 🎉 🎁 💡'.split(' ') },
-];
-
-// Small accessible emoji grid. `quick` shows the one-tap reactions first.
-export default function EmojiPicker({ onPick, onClose, quick = false, label = 'Emoji picker' }) {
-  const [tab, setTab] = useState(0);
+// Small accessible emoji and sticker picker (all data is bundled; nothing is fetched).
+export default function EmojiPicker({ onPick, onSticker, onClose, label = 'Emoji picker', anchor = 'up' }) {
+  const [tab, setTab] = useState('emoji');
+  const [cat, setCat] = useState(0);
+  const [pack, setPack] = useState(0);
+  const [query, setQuery] = useState('');
   const ref = useRef(null);
+  const closeRef = useRef(onClose);
+  useEffect(() => { closeRef.current = onClose; });
 
   useEffect(() => {
     const node = ref.current;
-    node.querySelector('button.emoji')?.focus();
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
-    const onDown = (e) => { if (!node.contains(e.target) && !e.target.closest('[data-emoji-trigger]')) onClose(); };
+    node.querySelector('input')?.focus();
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); closeRef.current(); } };
+    const onDown = (e) => { if (!node.contains(e.target) && !e.target.closest('[data-picker-trigger]')) closeRef.current(); };
     node.addEventListener('keydown', onKey);
     document.addEventListener('mousedown', onDown);
     return () => { node.removeEventListener('keydown', onKey); document.removeEventListener('mousedown', onDown); };
-  }, [onClose]);
+  }, []);
 
-  const items = CATEGORIES[tab].items;
+  const results = query ? searchEmoji(query) : EMOJI_CATEGORIES[cat].items;
   return (
-    <div className="emoji-picker" role="dialog" aria-label={label} ref={ref}>
-      {quick && (
-        <div className="emoji-quick" role="group" aria-label="Quick reactions">
-          {QUICK_REACTIONS.map((e) => (
-            <button type="button" key={e} className="emoji" onClick={() => onPick(e)} aria-label={`React with ${e}`}>{e}</button>
-          ))}
+    <div className={`picker picker-${anchor}`} role="dialog" aria-label={label} ref={ref}>
+      <div className="picker-head">
+        <div className="tabs" role="tablist" aria-label="Picker type">
+          <button type="button" role="tab" aria-selected={tab === 'emoji'} className={tab === 'emoji' ? 'on' : ''} onClick={() => setTab('emoji')}>Emoji</button>
+          {onSticker && <button type="button" role="tab" aria-selected={tab === 'stickers'} className={tab === 'stickers' ? 'on' : ''} onClick={() => setTab('stickers')}>Stickers</button>}
         </div>
+        <button type="button" className="icon-btn" onClick={onClose} aria-label="Close picker"><Icon name="close" size={16} /></button>
+      </div>
+      {tab === 'emoji' ? (
+        <>
+          <input type="search" className="picker-search" placeholder="Search emoji" aria-label="Search emoji" value={query} onChange={(e) => setQuery(e.target.value)} />
+          {!query && (
+            <div className="picker-cats" role="tablist" aria-label="Emoji categories">
+              {EMOJI_CATEGORIES.map((c, i) => (
+                <button key={c.id} type="button" role="tab" aria-selected={i === cat} aria-label={c.label} className={i === cat ? 'on' : ''} onClick={() => setCat(i)}>{c.icon}</button>
+              ))}
+            </div>
+          )}
+          <div className="picker-grid" role="group" aria-label={query ? 'Search results' : EMOJI_CATEGORIES[cat].label}>
+            {results.map((it) => (
+              <button key={it.emoji} type="button" className="emoji" title={it.words.split(' ')[0]} aria-label={it.words.split(' ')[0] || it.emoji} onClick={() => onPick(it.emoji)}>{it.emoji}</button>
+            ))}
+            {!results.length && <p className="muted pad">No emoji found.</p>}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="picker-cats" role="tablist" aria-label="Sticker packs">
+            {STICKER_PACKS.map((p, i) => (
+              <button key={p.id} type="button" role="tab" aria-selected={i === pack} className={`wide ${i === pack ? 'on' : ''}`} onClick={() => setPack(i)}>{p.label}</button>
+            ))}
+          </div>
+          <div className="sticker-grid" role="group" aria-label={`${STICKER_PACKS[pack].label} stickers`}>
+            {STICKER_PACKS[pack].items.map(([emoji, caption]) => (
+              <button key={caption} type="button" className="sticker" onClick={() => onSticker(emoji, caption)}>
+                <span aria-hidden="true">{emoji}</span>
+                <small>{caption}</small>
+              </button>
+            ))}
+          </div>
+        </>
       )}
-      <div className="emoji-tabs" role="tablist" aria-label="Emoji categories">
-        {CATEGORIES.map((c, i) => (
-          <button type="button" role="tab" key={c.id} aria-selected={i === tab} aria-label={c.label} className={`emoji-tab${i === tab ? ' active' : ''}`} onClick={() => setTab(i)}>{c.icon}</button>
-        ))}
-      </div>
-      <div className="emoji-grid" role="tabpanel">
-        {items.map((e) => (
-          <button type="button" key={e} className="emoji" onClick={() => onPick(e)} aria-label={e}>{e}</button>
-        ))}
-      </div>
     </div>
   );
 }
