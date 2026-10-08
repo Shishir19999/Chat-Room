@@ -1,26 +1,22 @@
 import http from 'http';
-import mongoose from 'mongoose';
+import { randomBytes } from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import { Server } from 'socket.io';
-import ChatMessage from './models/ChatMessage.js';
-import Room from './models/Room.js';
+import Op from './models/Op.js';
+import Workspace from './models/Workspace.js';
+import User from './models/User.js';
+import Report from './models/Report.js';
+import { C2S, S2C, EPH_TYPES, EPH_MAX_BYTES, ERROR } from './events.js';
+import { LIMITS, OP, RATES, DEFAULT_CHANNELS } from './shared/constants.js';
+import { cleanWorkspace, dmMembers, isDm, isGroup, isUid, registerKey, validateOp } from './shared/ops.js';
+import { createRateLimiter } from './lib/ratelimit.js';
+import { hashPassword, safeEqualHex, sha256, verifyPassword } from './lib/password.js';
+import { fetchHistory } from './lib/history.js';
+import { createUploadsRouter } from './lib/uploads.js';
 
-const MAX_USER_LEN = 30;
-const MAX_MESSAGE_LEN = 500;
-const MAX_ROOM_LEN = 30;
-const DEFAULT_PAGE = 50;
-const MAX_PAGE = 100;
-const DEFAULT_ROOM = 'general';
-const MAX_DESC_LEN = 80;
-const MAX_IMAGE_LEN = 400000; // data URL characters (about 300 KB of image)
-const MAX_EMOJI_LEN = 8;
-const MAX_REACTION_KINDS = 12;
-const MAX_SNIPPET = 140;
-
-// ---- helpers ----
-const clean = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
-const cleanRoom = (value) => clean(value, MAX_ROOM_LEN).toLowerCase().replace(/[^a-z0-9_-]/g, '') || DEFAULT_ROOM;
+const MAX_CHANNELS = 40;
+const clean = (value, max) => (typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max) : '');
 
 // CORS_ORIGIN: comma-separated list of allowed origins (REST + Socket.IO), e.g.
 // http://localhost:5173,http://192.168.1.20:5173. Use * to allow any origin.
@@ -30,194 +26,37 @@ export function corsOptionsFromEnv() {
     return { origin: allowedOrigins.includes('*') ? true : allowedOrigins };
 }
 
-const escapeRegex = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const isImageDataUrl = (v) => typeof v === 'string' && v.length <= MAX_IMAGE_LEN && /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(v);
-const roomFilter = (room) => (room === DEFAULT_ROOM ? { $or: [{ room: DEFAULT_ROOM }, { room: { $exists: false } }] } : { room });
-const isObjectId = (v) => typeof v === 'string' && mongoose.Types.ObjectId.isValid(v) && String(new mongoose.Types.ObjectId(v)) === v.toLowerCase();
-
-async function saveMessage({ user, message, room, image, replyTo }) {
-    const u = clean(user, MAX_USER_LEN);
-    const m = clean(message, MAX_MESSAGE_LEN);
-    const img = image && isImageDataUrl(image) ? image : undefined;
-    if (!u || (!m && !img)) return null;
-    const r = cleanRoom(room);
-    const data = { user: u, message: m, room: r };
-    if (img) data.image = img;
-    if (isObjectId(replyTo)) {
-        const parent = await ChatMessage.findById(replyTo);
-        if (parent && cleanRoom(parent.room) === r) {
-            data.replyTo = { _id: parent._id, user: parent.user, message: parent.deleted ? '' : (parent.message || (parent.image ? 'Image' : '')).slice(0, MAX_SNIPPET) };
-        }
-    }
-    const doc = new ChatMessage(data);
-    await doc.save();
-    return doc;
-}
-
-// Edit, delete and react helpers: return { doc } or { error }.
-async function loadInRoom(id, room) {
-    if (!isObjectId(id)) return { error: 'Unknown message' };
-    const doc = await ChatMessage.findById(id);
-    if (!doc || cleanRoom(doc.room) !== room) return { error: 'Unknown message' };
-    return { doc };
-}
-
-async function editMessage({ id, user, room, message }) {
-    const { doc, error } = await loadInRoom(id, room);
-    if (error) return { error };
-    if (doc.user !== user) return { error: 'You can only edit your own messages' };
-    if (doc.deleted) return { error: 'Message was deleted' };
-    const m = clean(message, MAX_MESSAGE_LEN);
-    if (!m && !doc.image) return { error: `Message must be 1-${MAX_MESSAGE_LEN} characters` };
-    doc.message = m;
-    doc.editedAt = new Date();
-    await doc.save();
-    return { doc };
-}
-
-async function deleteMessage({ id, user, room }) {
-    const { doc, error } = await loadInRoom(id, room);
-    if (error) return { error };
-    if (doc.user !== user) return { error: 'You can only delete your own messages' };
-    doc.deleted = true;
-    doc.message = '';
-    doc.image = undefined;
-    doc.reactions = [];
-    await doc.save();
-    return { doc };
-}
-
-async function toggleReaction({ id, user, room, emoji }) {
-    const e = clean(emoji, MAX_EMOJI_LEN);
-    if (!e || /[<>&]/.test(e)) return { error: 'Invalid emoji' };
-    const { doc, error } = await loadInRoom(id, room);
-    if (error) return { error };
-    if (doc.deleted) return { error: 'Message was deleted' };
-    const entry = doc.reactions.find((r) => r.emoji === e);
-    if (entry) {
-        if (entry.users.includes(user)) entry.users = entry.users.filter((u) => u !== user);
-        else entry.users.push(user);
-        if (entry.users.length === 0) doc.reactions = doc.reactions.filter((r) => r.emoji !== e);
-    } else {
-        if (doc.reactions.length >= MAX_REACTION_KINDS) return { error: 'Too many different reactions' };
-        doc.reactions.push({ emoji: e, users: [user] });
-    }
-    await doc.save();
-    return { doc };
-}
+const newer = (a, b) => a.lc > b.lc || (a.lc === b.lc && a.id > b.id);
 
 // Builds the HTTP + Socket.IO server (not listening, not connected to MongoDB).
 export function createChatServer() {
     const app = express();
     const corsOptions = corsOptionsFromEnv();
+    app.disable('x-powered-by');
     app.use(cors(corsOptions));
-    app.use(express.json({ limit: '1mb' }));
-    // Express 5 leaves req.body undefined when no body is sent; keep the Express 4 behavior (empty object).
+    app.use(express.json({ limit: '64kb' }));
     app.use((req, res, next) => { if (req.body === undefined) req.body = {}; next(); });
 
     const server = http.createServer(app);
-    const io = new Server(server, { cors: corsOptions });
+    const io = new Server(server, { cors: corsOptions, maxHttpBufferSize: 256 * 1024 });
+    const uploadTokens = new Map(); // token -> { uid, ws, socketId }
+    const joinLimiter = createRateLimiter({ capacity: 60, refillPerSec: 2 });
+    const failLimiter = createRateLimiter({ capacity: 8, refillPerSec: 0.1 }); // wrong passwords / identities per address
+    const sweeper = setInterval(() => { joinLimiter.sweep(); failLimiter.sweep(); }, 5 * 60 * 1000);
+    sweeper.unref();
+    server.on('close', () => clearInterval(sweeper));
 
-    // ---- REST ----
-    // Cursor pagination, newest first from the DB but returned oldest -> newest:
-    //   GET /messages?room=general&limit=50            latest page
-    //   GET /messages?room=general&before=<id|ISO>&limit=50   older page
-    // Response: { data: [...oldest..newest], hasMore, nextBefore }  (nextBefore = id of the oldest item)
-    app.get('/messages', async (req, res) => {
-        try {
-            const room = cleanRoom(req.query.room);
-            const limit = Math.min(MAX_PAGE, Math.max(1, parseInt(req.query.limit, 10) || DEFAULT_PAGE));
-            const conds = [roomFilter(room)];
-            const q = clean(req.query.q, 100);
-            if (q) conds.push({ deleted: { $ne: true }, message: { $regex: escapeRegex(q), $options: 'i' } });
+    // ---------- REST ----------
+    app.get('/health', (req, res) => res.json({ ok: true }));
 
-            const before = typeof req.query.before === 'string' ? req.query.before.trim() : '';
-            if (before) {
-                if (isObjectId(before)) {
-                    const ref = await ChatMessage.findById(before).select('createdAt');
-                    if (!ref) return res.status(400).json({ error: 'Unknown "before" cursor' });
-                    conds.push({ $or: [{ createdAt: { $lt: ref.createdAt } }, { createdAt: ref.createdAt, _id: { $lt: ref._id } }] });
-                } else {
-                    const d = new Date(before);
-                    if (Number.isNaN(d.getTime())) return res.status(400).json({ error: '"before" must be a message id or an ISO date' });
-                    conds.push({ createdAt: { $lt: d } });
-                }
-            }
-            const rows = await ChatMessage.find({ $and: conds }).sort({ createdAt: -1, _id: -1 }).limit(limit + 1);
-            const hasMore = rows.length > limit;
-            const page = rows.slice(0, limit).reverse();
-            res.json({ data: page, hasMore, nextBefore: hasMore && page.length ? page[0]._id : null });
-        } catch (error) {
-            console.error(error.message);
-            res.status(500).json({ error: 'Internal Server Error' });
-        }
-    });
-
-    app.post('/messages', async (req, res) => {
-        try {
-            const doc = await saveMessage(req.body || {});
-            if (!doc) {
-                return res.status(400).json({ error: `User (max ${MAX_USER_LEN}) and message (max ${MAX_MESSAGE_LEN}) are required` });
-            }
-            io.to(doc.room).emit('message', doc);
-            io.emit('activity', { room: doc.room, _id: doc._id, user: doc.user });
-            res.status(201).json(doc);
-        } catch (error) {
-            console.error(error.message);
-            res.status(500).json({ error: 'Internal Server Error' });
-        }
-    });
-
-    // Rooms: explicitly created rooms plus every room that already has messages.
+    // Public rooms with their activity, for the landing screen. Private rooms are never listed.
     app.get('/rooms', async (req, res) => {
         try {
-            const [created, stats] = await Promise.all([
-                Room.find().lean(),
-                ChatMessage.aggregate([{ $group: { _id: { $ifNull: ['$room', DEFAULT_ROOM] }, count: { $sum: 1 }, lastAt: { $max: '$createdAt' } } }]),
-            ]);
-            const map = new Map();
-            map.set(DEFAULT_ROOM, { name: DEFAULT_ROOM, description: 'Everyone is welcome here', count: 0, lastAt: null });
-            for (const r of created) map.set(r.name, { name: r.name, description: r.description || '', count: 0, lastAt: null });
-            for (const st of stats) {
-                const cur = map.get(st._id) || { name: st._id, description: '', count: 0, lastAt: null };
-                map.set(st._id, { ...cur, count: st.count, lastAt: st.lastAt });
-            }
-            const order = (a, b) => (a.name === DEFAULT_ROOM ? -1 : b.name === DEFAULT_ROOM ? 1 : a.name.localeCompare(b.name));
-            res.json({ data: [...map.values()].sort(order) });
-        } catch (error) {
-            console.error(error.message);
-            res.status(500).json({ error: 'Internal Server Error' });
-        }
-    });
-
-    app.post('/rooms', async (req, res) => {
-        try {
-            const raw = clean(req.body.name, MAX_ROOM_LEN).toLowerCase().replace(/[^a-z0-9_-]/g, '');
-            if (raw.length < 2) return res.status(400).json({ error: 'Room name needs 2-30 letters, numbers, - or _' });
-            const exists = raw === DEFAULT_ROOM || await Room.exists({ name: raw }) || await ChatMessage.exists({ room: raw });
-            if (exists) return res.status(409).json({ error: `Room #${raw} already exists` });
-            const room = await Room.create({ name: raw, description: clean(req.body.description, MAX_DESC_LEN), createdBy: clean(req.body.user, MAX_USER_LEN) });
-            const out = { name: room.name, description: room.description, count: 0, lastAt: null };
-            io.emit('rooms_changed', out);
-            res.status(201).json(out);
-        } catch (error) {
-            if (error.code === 11000) return res.status(409).json({ error: 'Room already exists' });
-            console.error(error.message);
-            res.status(500).json({ error: 'Internal Server Error' });
-        }
-    });
-
-    // Unread counts: body { user, since: { room: ISO date } } -> { data: { room: count } }
-    app.post('/rooms/unread', async (req, res) => {
-        try {
-            const user = clean(req.body.user, MAX_USER_LEN);
-            const since = req.body.since && typeof req.body.since === 'object' ? req.body.since : {};
-            const out = {};
-            for (const [name, iso] of Object.entries(since).slice(0, 100)) {
-                const d = new Date(iso);
-                if (Number.isNaN(d.getTime())) continue;
-                const room = cleanRoom(name);
-                out[room] = await ChatMessage.countDocuments({ $and: [roomFilter(room), { createdAt: { $gt: d }, user: { $ne: user }, deleted: { $ne: true } }] });
+            const rows = await Workspace.find({ isPrivate: false }).sort({ lastAt: -1 }).limit(30).lean();
+            const out = [];
+            for (const w of rows) {
+                const online = new Set((await io.in(w.name).fetchSockets()).map((s) => s.data.uid)).size;
+                out.push({ name: w.name, online, lastAt: w.lastAt });
             }
             res.json({ data: out });
         } catch (error) {
@@ -226,96 +65,220 @@ export function createChatServer() {
         }
     });
 
-    // ---- Socket.IO ----
-    // presence[room] = Map(socketId -> username)
-    const presence = new Map();
+    app.use(createUploadsRouter({ tokens: uploadTokens }));
 
-    const onlineUsers = (room) => {
-        const users = presence.get(room);
-        return users ? [...new Set(users.values())] : [];
-    };
+    // ---------- helpers ----------
+    const userRoom = (ws, uid) => `${ws}|u|${uid}`;
 
-    function leaveRoom(socket) {
-        const { room } = socket.data;
-        if (!room) return;
-        socket.leave(room);
-        const users = presence.get(room);
-        if (users) {
-            users.delete(socket.id);
-            if (users.size === 0) presence.delete(room);
-        }
-        socket.data.room = null;
-        io.to(room).emit('presence', { room, users: onlineUsers(room) });
-        io.to(room).emit('typing', { room, user: socket.data.user, typing: false });
+    async function groupOf(ws, c) {
+        return Op.findOne({ w: ws, k: `g:${c.slice(4)}` }).lean();
     }
 
+    // Returns an error string or '' when the op may be stored; also returns the audience for delivery.
+    async function authorize(ws, uid, op) {
+        if (op.a !== uid) return { error: 'Author mismatch' };
+        if (op.w !== ws) return { error: 'Wrong room' };
+        if (isGroup(op.c)) {
+            const def = await groupOf(ws, op.c);
+            if (op.t === OP.GROUP) {
+                if (def && def.a !== uid) return { error: 'Only the creator can change a group' };
+                if (!op.d.members.includes(uid)) return { error: 'Creator must be a member' };
+                return { members: [...new Set([...(def?.d.members || []), ...op.d.members])] };
+            }
+            if (!def || def.d.del || !def.d.members.includes(uid)) return { error: 'Not a member of this group' };
+            return { members: def.d.members };
+        }
+        if (op.t === OP.GROUP) return { error: 'Groups live in group channels' };
+        if (isDm(op.c)) return { members: dmMembers(op.c) };
+        if (op.t === OP.CHANNEL) {
+            const exists = await Op.exists({ w: ws, k: `ch:${op.d.name}` });
+            if (!exists && !DEFAULT_CHANNELS.includes(op.d.name) && (await Op.countDocuments({ w: ws, t: OP.CHANNEL })) >= MAX_CHANNELS) return { error: 'Too many channels' };
+        }
+        if ([OP.EDIT, OP.DEL, OP.REACT, OP.PIN].includes(op.t)) {
+            const target = await Op.findOne({ w: ws, id: op.d.x, t: OP.MSG }).select('a c').lean();
+            if (!target || target.c !== op.c) return { error: 'Unknown message' };
+            if ((op.t === OP.EDIT || op.t === OP.DEL) && target.a !== uid) return { error: 'You can only change your own messages' };
+        }
+        return { members: null };
+    }
+
+    async function storeOp(ws, op) {
+        const k = registerKey(op);
+        const doc = { w: ws, id: op.id, c: op.c, t: op.t, a: op.a, lc: op.lc, ts: op.ts, d: op.d, ...(k ? { k } : {}) };
+        if (k) {
+            const prev = await Op.findOne({ w: ws, k }).lean();
+            if (prev && !newer(op, prev)) return { stale: true };
+            if (prev) await Op.deleteOne({ _id: prev._id });
+        }
+        try {
+            await Op.create(doc);
+        } catch (e) {
+            if (e.code === 11000) return { duplicate: true };
+            throw e;
+        }
+        return {};
+    }
+
+    async function joinWorkspace(socket, p) {
+        const ws = cleanWorkspace(p.ws);
+        const uid = p.uid;
+        const name = clean(p.profile?.name, LIMITS.name);
+        if (!ws || !isUid(uid) || !name || typeof p.secret !== 'string' || p.secret.length < 16 || p.secret.length > 128) return { ok: false, code: ERROR.BAD_REQUEST, error: 'Invalid join request.' };
+
+        const secretHash = sha256(p.secret);
+        const user = await User.findOne({ uid });
+        if (!user) {
+            try { await User.create({ uid, secretHash, name }); } catch (e) { if (e.code !== 11000) throw e; return { ok: false, code: ERROR.IDENTITY, error: 'This identity belongs to someone else.' }; }
+        } else if (!safeEqualHex(user.secretHash, secretHash)) {
+            return { ok: false, code: ERROR.IDENTITY, error: 'This identity belongs to someone else.' };
+        } else {
+            user.name = name; user.lastAt = new Date();
+            await user.save();
+        }
+
+        let room = await Workspace.findOne({ name: ws });
+        let isNew = false;
+        const password = typeof p.password === 'string' ? p.password.slice(0, LIMITS.password) : '';
+        if (!room) {
+            const secret = password ? await hashPassword(password) : {};
+            try {
+                room = await Workspace.create({ name: ws, isPrivate: Boolean(password), createdBy: uid, ...secret });
+                isNew = true;
+            } catch (e) {
+                if (e.code !== 11000) throw e;
+                room = await Workspace.findOne({ name: ws });
+            }
+        }
+        if (room.isPrivate && !(await verifyPassword(password, room))) return { ok: false, code: ERROR.WRONG_PASSWORD, error: 'Wrong room password.' };
+
+        if (socket.data.ws && socket.data.ws !== ws) leaveWorkspace(socket);
+        socket.data.uid = uid;
+        socket.data.ws = ws;
+        socket.data.profile = { name, color: Number.isInteger(p.profile?.color) ? p.profile.color : 0, status: clean(p.profile?.status, LIMITS.status), presence: 'online' };
+        socket.join(ws);
+        socket.join(userRoom(ws, uid));
+        const token = randomBytes(24).toString('hex');
+        uploadTokens.set(token, { uid, ws, socketId: socket.id });
+        socket.data.uploadToken = token;
+
+        const others = (await io.in(ws).fetchSockets()).filter((s) => s.id !== socket.id);
+        socket.to(ws).emit(S2C.PEER_JOIN, { peerId: socket.id, uid, profile: socket.data.profile });
+        return {
+            ok: true, selfId: socket.id, uploadToken: token, isNew, private: room.isPrivate,
+            peers: others.map((s) => ({ peerId: s.id, uid: s.data.uid, profile: s.data.profile })),
+        };
+    }
+
+    function leaveWorkspace(socket) {
+        const { ws, uid, uploadToken } = socket.data;
+        if (!ws) return;
+        if (uploadToken) uploadTokens.delete(uploadToken);
+        socket.to(ws).emit(S2C.PEER_LEAVE, { peerId: socket.id, uid });
+        socket.leave(ws);
+        socket.leave(userRoom(ws, uid));
+        socket.data.ws = null;
+    }
+
+    // ---------- Socket.IO ----------
     io.on('connection', (socket) => {
-        socket.on('join', (payload = {}) => {
-            const user = clean(payload.user, MAX_USER_LEN);
-            if (!user) {
-                socket.emit('error_message', 'Username is required');
-                return;
-            }
-            leaveRoom(socket);
-            const room = cleanRoom(payload.room);
-            socket.data.user = user;
-            socket.data.room = room;
-            socket.join(room);
-            if (!presence.has(room)) presence.set(room, new Map());
-            presence.get(room).set(socket.id, user);
-            io.to(room).emit('presence', { room, users: onlineUsers(room) });
-            socket.emit('joined', { room, user });
-        });
+        const limits = { op: createRateLimiter(RATES.op), eph: createRateLimiter(RATES.eph), hist: createRateLimiter(RATES.hist) };
+        const reply = (ack, payload) => { if (typeof ack === 'function') ack(payload); };
+        const requireJoined = (ack) => {
+            if (socket.data.ws) return true;
+            reply(ack, { ok: false, code: ERROR.NOT_JOINED, error: 'Join a room first.' });
+            return false;
+        };
 
-        socket.on('leave', () => leaveRoom(socket));
-
-        socket.on('message', async (payload = {}, ack) => {
+        socket.on(C2S.JOIN, async (payload, ack) => {
             try {
-                const { user, room } = socket.data;
-                if (!room) {
-                    if (typeof ack === 'function') ack({ ok: false, error: 'Join a room first' });
-                    return;
-                }
-                const doc = await saveMessage({ user, message: payload.message, room, image: payload.image, replyTo: payload.replyTo });
-                if (!doc) {
-                    if (typeof ack === 'function') ack({ ok: false, error: `Message must be 1-${MAX_MESSAGE_LEN} characters` });
-                    return;
-                }
-                io.to(room).emit('message', doc);
-                io.emit('activity', { room, _id: doc._id, user: doc.user });
-                if (typeof ack === 'function') ack({ ok: true });
+                const key = socket.handshake.address || socket.id;
+                if (!joinLimiter.take(key) || !failLimiter.has(key)) return reply(ack, { ok: false, code: ERROR.RATE, error: 'Too many attempts. Wait a moment.' });
+                if (!payload || typeof payload !== 'object') return reply(ack, { ok: false, code: ERROR.BAD_REQUEST, error: 'Invalid join request.' });
+                const result = await joinWorkspace(socket, payload);
+                if (!result.ok && (result.code === ERROR.WRONG_PASSWORD || result.code === ERROR.IDENTITY)) failLimiter.take(key);
+                return reply(ack, result);
             } catch (error) {
                 console.error(error.message);
-                if (typeof ack === 'function') ack({ ok: false, error: 'Could not save message' });
+                return reply(ack, { ok: false, error: 'Could not join the room.' });
             }
         });
 
-        // edit / delete / react: ack { ok, error }; everyone in the room gets 'message_updated'
-        const mutation = (event, fn) => socket.on(event, async (payload = {}, ack) => {
-            const reply = typeof ack === 'function' ? ack : () => {};
+        socket.on(C2S.PING, (ack) => reply(ack, { ok: true }));
+        socket.on(C2S.LEAVE, () => leaveWorkspace(socket));
+
+        socket.on(C2S.OP, async (op, ack) => {
             try {
-                const { user, room } = socket.data;
-                if (!room) return reply({ ok: false, error: 'Join a room first' });
-                const { doc, error } = await fn({ ...payload, user, room });
-                if (error) return reply({ ok: false, error });
-                io.to(room).emit('message_updated', doc);
-                return reply({ ok: true });
+                if (!requireJoined(ack)) return;
+                if (!limits.op.take('op')) return reply(ack, { ok: false, code: ERROR.RATE, error: 'You are sending too fast.' });
+                const { ws, uid } = socket.data;
+                const problem = validateOp(op);
+                if (problem) return reply(ack, { ok: false, error: `Invalid message (${problem}).` });
+                const auth = await authorize(ws, uid, op);
+                if (auth.error) return reply(ack, { ok: false, code: ERROR.FORBIDDEN, error: auth.error });
+                const stored = await storeOp(ws, op);
+                if (stored.duplicate || stored.stale) return reply(ack, { ok: true, duplicate: Boolean(stored.duplicate) });
+                Workspace.updateOne({ name: ws }, { lastAt: new Date() }).catch(() => {});
+                const wire = { id: op.id, w: ws, c: op.c, t: op.t, a: op.a, lc: op.lc, ts: op.ts, d: op.d };
+                if (auth.members) {
+                    let target = socket;
+                    for (const m of auth.members) target = target.to(userRoom(ws, m));
+                    target.emit(S2C.OP, wire, { uid });
+                } else {
+                    socket.to(ws).emit(S2C.OP, wire, { uid });
+                }
+                return reply(ack, { ok: true });
             } catch (error) {
                 console.error(error.message);
-                return reply({ ok: false, error: 'Could not update message' });
+                return reply(ack, { ok: false, error: 'Could not save the message.' });
             }
         });
-        mutation('edit', editMessage);
-        mutation('delete', deleteMessage);
-        mutation('react', toggleReaction);
 
-        socket.on('typing', (typing) => {
-            const { room, user } = socket.data;
-            if (!room) return;
-            socket.to(room).emit('typing', { room, user, typing: Boolean(typing) });
+        socket.on(C2S.EPH, (req) => {
+            const { ws, uid } = socket.data;
+            if (!ws || !req || typeof req !== 'object' || !EPH_TYPES.includes(req.type)) return;
+            if (!limits.eph.take('eph')) return;
+            let size = 0;
+            try { size = JSON.stringify(req.data ?? null).length; } catch { return; }
+            if (size > EPH_MAX_BYTES) return;
+            const out = { type: req.type, data: req.data };
+            const ctx = { peerId: socket.id, uid };
+            if (typeof req.peerId === 'string') io.to(req.peerId).emit(S2C.EPH, out, ctx);
+            else if (Array.isArray(req.toUids) && req.toUids.length <= LIMITS.groupMembers) {
+                let target = socket;
+                for (const m of req.toUids.filter(isUid)) target = target.to(userRoom(ws, m));
+                target.emit(S2C.EPH, out, ctx);
+            } else socket.to(ws).emit(S2C.EPH, out, ctx);
+            if (req.type === 'hi' && req.data?.profile) {
+                const prof = req.data.profile;
+                socket.data.profile = { ...socket.data.profile, name: clean(prof.name, LIMITS.name) || socket.data.profile.name, color: Number.isInteger(prof.color) ? prof.color : socket.data.profile.color, status: clean(prof.status, LIMITS.status), presence: socket.data.profile.presence };
+            }
+            if (req.type === 'pres' && typeof req.data?.state === 'string') socket.data.profile = { ...socket.data.profile, presence: req.data.state };
         });
 
-        socket.on('disconnect', () => leaveRoom(socket));
+        socket.on(C2S.HISTORY, async (query, ack) => {
+            try {
+                if (!requireJoined(ack)) return;
+                if (!limits.hist.take('hist')) return reply(ack, { ok: false, code: ERROR.RATE, ops: [] });
+                return reply(ack, { ok: true, ops: await fetchHistory(socket.data.ws, socket.data.uid, query) });
+            } catch (error) {
+                console.error(error.message);
+                return reply(ack, { ok: false, ops: [] });
+            }
+        });
+
+        socket.on(C2S.REPORT, async (payload, ack) => {
+            try {
+                if (!requireJoined(ack)) return;
+                if (!payload || typeof payload.id !== 'string' || typeof payload.c !== 'string') return reply(ack, { ok: false });
+                await Report.create({ w: socket.data.ws, c: payload.c.slice(0, 60), messageId: payload.id.slice(0, 40), by: socket.data.uid, reason: clean(payload.reason, 200) });
+                return reply(ack, { ok: true });
+            } catch (error) {
+                console.error(error.message);
+                return reply(ack, { ok: false });
+            }
+        });
+
+        socket.on('disconnect', () => leaveWorkspace(socket));
     });
 
     return { app, server, io };

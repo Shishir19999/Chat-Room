@@ -1,114 +1,114 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import Message from './Message.jsx';
 import Icon from './Icon.jsx';
-import { MessageSkeletons } from './Skeleton.jsx';
-import { dayLabel, decorateMessages } from '../lib/text.js';
+import { dayLabel, decorateMessages } from '../lib/format.js';
 
-export default function MessageList({ chat, room, me, actions }) {
-  const { messages, phase, error, hasMore, loadingOlder } = chat;
-  const scroller = useRef(null);
-  const prev = useRef({ first: null, last: null, height: 0, room: null });
-  const nearBottom = useRef(true);
-  const [unseen, setUnseen] = useState(false);
-  const rows = useMemo(() => decorateMessages(messages), [messages]);
+const NEAR_BOTTOM = 80;
 
-  const toBottom = (smooth) => {
-    const el = scroller.current;
+// The scrolling conversation: date separators, "new messages" divider, load-older, jump buttons.
+export default function MessageList({ channel, messages, engine, ctx, anchor, empty }) {
+  const box = useRef(null);
+  const [atBottom, setAtBottom] = useState(true);
+  const [below, setBelow] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [done, setDone] = useState(false);
+  const [dividerVisible, setDividerVisible] = useState(true);
+  const stick = useRef(true);
+  const prev = useRef({ channel: null, count: 0, lastId: '', height: 0, first: '' });
+
+  const items = useMemo(() => decorateMessages(messages, { unreadAfter: anchor, me: engine.me.uid }), [messages, anchor, engine]);
+  const hasDivider = items.some((i) => i.divider);
+
+  const scrollToBottom = useCallback((smooth = false) => {
+    const el = box.current;
     if (!el) return;
     const reduce = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
     el.scrollTo({ top: el.scrollHeight, behavior: smooth && !reduce ? 'smooth' : 'auto' });
-  };
-
-  useLayoutEffect(() => {
-    const el = scroller.current;
-    if (!el) return;
-    const p = prev.current;
-    const first = messages[0]?._id ?? null;
-    const last = messages.at(-1)?._id ?? null;
-    if (p.room !== room || p.last === null) {
-      toBottom(false);
-      setUnseen(false);
-    } else if (first !== p.first && last === p.last) {
-      el.scrollTop += el.scrollHeight - p.height; // older page prepended: keep position
-    } else if (last !== p.last) {
-      if (nearBottom.current || messages.at(-1)?.user === me) { toBottom(true); setUnseen(false); }
-      else setUnseen(true);
-    }
-    prev.current = { first, last, height: el.scrollHeight, room };
-  }, [messages, room, me]);
-
-  useEffect(() => {
-    const el = scroller.current;
-    if (!el) return undefined;
-    const onScroll = () => {
-      nearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
-      if (nearBottom.current) setUnseen(false);
-    };
-    el.addEventListener('scroll', onScroll, { passive: true });
-    return () => el.removeEventListener('scroll', onScroll);
   }, []);
 
-  let body;
-  if (phase === 'loading') body = <MessageSkeletons />;
-  else if (phase === 'error') {
-    body = (
-      <div className="state" role="alert">
-        <h3>Could not load messages</h3>
-        <p>{error || 'Something went wrong.'}</p>
-        <button type="button" className="btn btn-primary" onClick={chat.retry}><Icon name="refresh" size={16} /> Try again</button>
-      </div>
-    );
-  } else if (messages.length === 0) {
-    body = (
-      <div className="state">
-        <div className="state-art" aria-hidden="true">💬</div>
-        <h3>No messages in #{room} yet</h3>
-        <p>Be the first to say something. Say hi, share an idea or paste an image.</p>
-      </div>
-    );
-  } else {
-    body = (
-      <ol className="messages" aria-label={`Messages in ${room}`}>
-        {hasMore && (
-          <li className="older">
-            <button type="button" className="btn btn-sm" data-testid="load-older" onClick={actions.loadOlder} disabled={loadingOlder}>
-              {loadingOlder ? 'Loading...' : 'Load older messages'}
-            </button>
-          </li>
-        )}
-        {rows.map(({ message, newDay, grouped }) => (
-          <MessageRow key={message._id} message={message} newDay={newDay} grouped={grouped} me={me} actions={actions} />
-        ))}
-      </ol>
-    );
-  }
+  const jumpTo = useCallback((id) => {
+    const node = box.current?.querySelector(`[data-id="${id}"]`);
+    if (!node) return false;
+    node.scrollIntoView({ block: 'center' });
+    node.classList.add('flash');
+    node.focus({ preventScroll: true });
+    setTimeout(() => node.classList.remove('flash'), 1600);
+    return true;
+  }, []);
+  useEffect(() => { ctx.registerJump?.(jumpTo); }, [ctx, jumpTo]);
+
+  // Channel switch, new messages and prepended history keep the viewport where the reader expects it.
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    const p = prev.current;
+    const last = messages[messages.length - 1];
+    const first = messages[0];
+    if (p.channel !== channel) {
+      const divider = el.querySelector('.new-divider');
+      if (divider) divider.scrollIntoView({ block: 'start' }); else scrollToBottom();
+      stick.current = !divider;
+      setDone(false);
+    } else if (first && p.first && first.id !== p.first && messages.length > p.count && last?.id === p.lastId) {
+      el.scrollTop += el.scrollHeight - p.height; // older messages were added above
+    } else if (last && last.id !== p.lastId) {
+      if (stick.current || last.mine) { scrollToBottom(); stick.current = true; }
+      else setBelow((n) => n + (messages.length - p.count));
+    }
+    prev.current = { channel, count: messages.length, lastId: last?.id || '', height: el.scrollHeight, first: first?.id || '' };
+  }, [channel, messages, scrollToBottom]);
+
+  const onScroll = () => {
+    const el = box.current;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM;
+    stick.current = near;
+    setAtBottom(near);
+    engine.setAtBottom(near);
+    if (near) setBelow(0);
+    const div = el.querySelector('.new-divider');
+    if (div) setDividerVisible(div.getBoundingClientRect().top < el.getBoundingClientRect().top + el.clientHeight && div.getBoundingClientRect().bottom > el.getBoundingClientRect().top);
+    prev.current.height = el.scrollHeight;
+  };
+
+  const older = async () => {
+    if (loading || done) return;
+    setLoading(true);
+    prev.current.height = box.current.scrollHeight;
+    try {
+      const res = await engine.loadOlder(channel);
+      if (res.done) setDone(true);
+    } finally { setLoading(false); }
+  };
+
+  const jumpUnread = () => {
+    box.current?.querySelector('.new-divider')?.scrollIntoView({ block: 'start', behavior: 'auto' });
+  };
 
   return (
-    <div className="message-area">
-      <div className="message-scroll" ref={scroller} tabIndex={-1}>{body}</div>
-      {unseen && (
-        <button type="button" className="jump-btn" onClick={() => { toBottom(true); setUnseen(false); }}>
-          <Icon name="down" size={16} /> New messages
+    <div className="list-wrap">
+      {hasDivider && !dividerVisible && (
+        <button type="button" className="jump jump-top" onClick={jumpUnread}><Icon name="arrowDown" size={14} /> Jump to first unread</button>
+      )}
+      <div className="list" ref={box} onScroll={onScroll} role="log" aria-label="Messages" aria-relevant="additions" tabIndex={0}>
+        <div className="list-top">
+          {done || !messages.length ? <p className="muted">{messages.length ? 'You are at the start of the conversation.' : ''}</p> : (
+            <button type="button" className="btn btn-quiet" onClick={older} disabled={loading}>{loading ? 'Loading...' : 'Load older messages'}</button>
+          )}
+        </div>
+        {!messages.length && empty}
+        {items.map((item) => (
+          <div key={item.message.id} className="row">
+            {item.newDay && <div className="day-sep" role="separator"><span>{dayLabel(item.message.ts)}</span></div>}
+            {item.divider && <div className="new-divider" role="separator" aria-label="New messages"><span>New messages</span></div>}
+            <Message item={item} ctx={ctx} />
+          </div>
+        ))}
+      </div>
+      {!atBottom && (
+        <button type="button" className="jump jump-bottom" onClick={() => { scrollToBottom(true); setBelow(0); }} aria-label={below ? `${below} new messages, scroll to latest` : 'Scroll to latest messages'}>
+          <Icon name="arrowDown" size={16} /> {below ? `${below} new` : 'Latest'}
         </button>
       )}
     </div>
-  );
-}
-
-function MessageRow({ message, newDay, grouped, me, actions }) {
-  return (
-    <>
-      {newDay && <li className="day-sep" role="separator" aria-label={dayLabel(message.createdAt)}><span>{dayLabel(message.createdAt)}</span></li>}
-      <Message
-        message={message}
-        grouped={grouped && !newDay}
-        me={me}
-        onReply={actions.reply}
-        onReact={actions.react}
-        onEdit={actions.edit}
-        onDelete={actions.askDelete}
-        onOpenImage={actions.openImage}
-      />
-    </>
   );
 }

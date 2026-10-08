@@ -1,9 +1,11 @@
-import { avatarColor, initials } from '../lib/text.js';
+import { avatarColor, initials } from '../lib/format.js';
 
-export default function Avatar({ name, size = 36 }) {
+// Initials on a coloured disc; the optional dot shows presence.
+export default function Avatar({ name, color, size = 36, presence, className = '' }) {
   return (
-    <span className="avatar" style={{ background: avatarColor(name), width: size, height: size, fontSize: size * 0.38 }} aria-hidden="true">
+    <span className={`avatar ${className}`} style={{ '--size': `${size}px`, background: avatarColor(color) }} aria-hidden="true">
       {initials(name)}
+      {presence && <span className={`presence presence-${presence}`} />}
     </span>
   );
 }

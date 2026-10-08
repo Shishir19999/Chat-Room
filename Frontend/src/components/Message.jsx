@@ -1,122 +1,116 @@
 import { memo, useState } from 'react';
 import Avatar from './Avatar.jsx';
 import Icon from './Icon.jsx';
-import EmojiPicker from './EmojiPicker.jsx';
+import Menu from './Menu.jsx';
 import RichText from './RichText.jsx';
-import { formatTime, mentionsUser } from '../lib/text.js';
-import { LIMITS } from '../lib/limits.js';
+import Attachment from './Attachment.jsx';
+import EmojiPicker from './EmojiPicker.jsx';
+import { QUICK_REACTIONS } from '../core/emoji.js';
+import { isJumbo } from '../core/sanitize.js';
+import { formatTime } from '../lib/format.js';
 
-function Message({ message: m, grouped, me, onReply, onReact, onEdit, onDelete, onOpenImage }) {
+function Receipt({ receipt }) {
+  if (!receipt) return null;
+  if (receipt.seen > 0) {
+    return <span className="receipt seen" title={`Seen by ${receipt.seenBy.join(', ')}`}><Icon name="checks" size={14} /> Seen by {receipt.seen}</span>;
+  }
+  if (receipt.delivered > 0) return <span className="receipt" title={`Delivered to ${receipt.delivered}`}><Icon name="checks" size={14} /> Delivered</span>;
+  return <span className="receipt" title="Saved on this device. It reaches people when they are connected."><Icon name={receipt.peers ? 'check' : 'clock'} size={14} /> {receipt.peers ? 'Sent' : 'Waiting for people'}</span>;
+}
+
+function MessageBase({ item, ctx, highlight = '', readOnly = false, compact = false }) {
+  const { message: m, grouped } = item;
+  const { engine, me, family, onReply, onThread, onEdit, onJump, onUser, onConfirmDelete, toast } = ctx;
   const [picker, setPicker] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState('');
-  const [saving, setSaving] = useState(false);
-  const [active, setActive] = useState(false);
-  const own = m.user === me;
-  const mentioned = !own && !m.deleted && mentionsUser(m.message, me);
+  const [revealed, setRevealed] = useState(false);
+  const jumbo = !m.deleted && !m.att && !m.stk && isJumbo(m.text);
 
-  const startEdit = () => { setDraft(m.message); setEditing(true); };
-  const save = async () => {
-    const text = draft.trim();
-    if (!text && !m.image) return;
-    if (text === m.message) { setEditing(false); return; }
-    setSaving(true);
-    try { await onEdit(m, text); setEditing(false); } finally { setSaving(false); }
-  };
+  const react = (emoji) => { const r = engine.react(m.id, m.c, emoji); if (r.error) toast(r.error, 'error'); };
+  const copy = () => navigator.clipboard?.writeText(m.text).then(() => toast('Message copied'), () => toast('Could not copy', 'error'));
 
-  const pick = (emoji) => { setPicker(false); onReact(m, emoji); };
+  if (m.muted && !revealed && !m.mine) {
+    return (
+      <article className="msg msg-muted" id={`m-${m.id}`}>
+        <span className="muted">Message from {m.name} (muted). </span>
+        <button type="button" className="link-btn" onClick={() => setRevealed(true)}>Show</button>
+      </article>
+    );
+  }
 
+  const menuItems = readOnly ? [] : [
+    m.mine && !m.deleted && !m.att && !m.stk && { label: 'Edit', icon: 'edit', onSelect: () => onEdit(m) },
+    !m.deleted && { label: m.pinned ? 'Unpin' : 'Pin message', icon: 'pin', onSelect: () => { const r = engine.pin(m.id, m.c, !m.pinned); if (r.error) toast(r.error, 'error'); } },
+    !m.deleted && m.text && { label: 'Copy text', icon: 'copy', onSelect: copy },
+    !m.mine && !m.deleted && { label: 'Report and hide', icon: 'flag', onSelect: () => { engine.reportMessage(m.id, m.c); toast('Message hidden on this device.'); } },
+    !m.mine && { label: `Mute ${m.name}`, icon: 'bellOff', onSelect: () => { engine.mute(m.a, true); toast(`${m.name} muted. Their messages are collapsed.`); } },
+    !m.mine && { label: `Block ${m.name}`, icon: 'ban', danger: true, onSelect: () => { engine.block(m.a, true); toast(`${m.name} blocked. You will not see their messages.`); } },
+    m.mine && !m.deleted && { label: 'Delete', icon: 'trash', danger: true, onSelect: () => onConfirmDelete(m) },
+  ];
+
+  const label = `${m.name}, ${formatTime(m.ts)}${m.deleted ? ', deleted message' : ''}`;
   return (
-    <li
-      className={`msg${own ? ' own' : ''}${grouped ? ' grouped' : ''}${mentioned ? ' mentioned' : ''}${active ? ' active' : ''}${m.deleted ? ' is-deleted' : ''}`}
-      data-id={m._id}
-      tabIndex={0}
-      aria-label={`${m.user} at ${formatTime(m.createdAt)}${m.deleted ? ', deleted message' : `: ${m.message || 'image'}`}`}
-      onClick={(e) => { if (!e.target.closest('button,a,textarea,img')) setActive((a) => !a); }}
-    >
-      <div className="msg-gutter">
-        {grouped ? <span className="msg-time-hover">{formatTime(m.createdAt)}</span> : <Avatar name={m.user} />}
+    <article className={`msg${grouped ? ' msg-grouped' : ''}${m.mine ? ' msg-mine' : ''}${m.mentionsMe ? ' msg-mention' : ''}${m.pinned ? ' msg-pinned' : ''}${compact ? ' msg-compact' : ''}`} id={`m-${m.id}`} data-id={m.id} aria-label={label} tabIndex={-1}>
+      <div className="msg-side">
+        {grouped ? <time className="msg-hover-time" dateTime={new Date(m.ts).toISOString()}>{formatTime(m.ts)}</time> : (
+          <button type="button" className="avatar-btn" onClick={() => onUser?.(m.a)} aria-label={`Open ${m.name}`} disabled={m.mine || !onUser}>
+            <Avatar name={m.name} color={m.color} />
+          </button>
+        )}
       </div>
       <div className="msg-main">
         {!grouped && (
-          <div className="msg-head">
-            <span className="msg-user">{m.user}{own && <span className="you"> (you)</span>}</span>
-            <time dateTime={m.createdAt}>{formatTime(m.createdAt)}</time>
-            {m.editedAt && !m.deleted && <span className="edited">edited</span>}
-          </div>
+          <header className="msg-head">
+            <strong className="msg-author">{m.name}{m.mine && <span className="you"> (you)</span>}</strong>
+            <time dateTime={new Date(m.ts).toISOString()}>{formatTime(m.ts)}</time>
+            {m.pinned && <span className="tag"><Icon name="pin" size={12} /> Pinned</span>}
+            {m.edited && <span className="muted edited" title={new Date(m.editedAt).toLocaleString()}>(edited)</span>}
+          </header>
         )}
-        {m.replyTo && (
-          <div className="reply-quote">
-            <Icon name="reply" size={14} />
-            <strong>{m.replyTo.user}</strong>
-            <span>{m.replyTo.message || 'Original message was deleted'}</span>
-          </div>
+        {m.reply && (
+          <button type="button" className="quote" onClick={() => !m.reply.missing && onJump?.(m.reply.id)} disabled={m.reply.missing || !onJump}>
+            <Icon name="reply" size={13} /> <strong>{m.reply.name || 'Someone'}</strong> <span>{m.reply.text}</span>
+          </button>
         )}
-        {editing ? (
-          <div className="edit-box">
-            <label className="sr-only" htmlFor={`edit-${m._id}`}>Edit message</label>
-            <textarea
-              id={`edit-${m._id}`}
-              value={draft}
-              maxLength={LIMITS.message}
-              rows={2}
-              autoFocus
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
-                if (e.key === 'Escape') { e.stopPropagation(); setEditing(false); }
-              }}
-            />
-            <div className="edit-actions">
-              <button type="button" className="btn btn-sm" onClick={() => setEditing(false)}>Cancel</button>
-              <button type="button" className="btn btn-sm btn-primary" onClick={save} disabled={saving || (!draft.trim() && !m.image)}>Save</button>
-              <span className="hint">Enter to save, Esc to cancel</span>
-            </div>
-          </div>
-        ) : m.deleted ? (
-          <p className="msg-text deleted-text">This message was deleted.</p>
+        {m.deleted ? (
+          <p className="msg-deleted"><Icon name="trash" size={14} /> This message was deleted</p>
         ) : (
           <>
-            {m.message && <p className="msg-text"><RichText text={m.message} me={me} /></p>}
-            {m.image && (
-              <button type="button" className="msg-image-btn" onClick={() => onOpenImage(m)} aria-label={`Open image from ${m.user}`}>
-                <img className="msg-image" src={m.image} alt={`Attachment from ${m.user}`} loading="lazy" />
-              </button>
-            )}
+            {m.stk && <p className="sticker-msg" role="img" aria-label="Sticker">{m.stk}</p>}
+            {m.text && <RichText text={m.text} me={me} highlight={highlight} filter={family} className={jumbo ? 'jumbo' : ''} />}
+            {m.att && <Attachment att={m.att} authorUid={m.a} mine={m.mine} engine={engine} />}
           </>
         )}
-        {m.reactions?.length > 0 && !m.deleted && (
+        {m.reactions.length > 0 && (
           <div className="reactions" role="group" aria-label="Reactions">
-            {m.reactions.map((r) => {
-              const mine = r.users.includes(me);
-              return (
-                <button
-                  type="button"
-                  key={r.emoji}
-                  className={`reaction${mine ? ' mine' : ''}`}
-                  aria-pressed={mine}
-                  aria-label={`${r.emoji} ${r.users.length} ${r.users.length === 1 ? 'reaction' : 'reactions'} from ${r.users.join(', ')}`}
-                  title={r.users.join(', ')}
-                  onClick={() => onReact(m, r.emoji)}
-                >
-                  <span aria-hidden="true">{r.emoji}</span> <span className="count">{r.users.length}</span>
-                </button>
-              );
-            })}
+            {m.reactions.map((r) => (
+              <button key={r.emoji} type="button" className={`chip${r.mine ? ' on' : ''}`} aria-pressed={r.mine} disabled={readOnly}
+                aria-label={`${r.emoji} ${r.count} ${r.count === 1 ? 'reaction' : 'reactions'}${r.mine ? ', including yours' : ''}`}
+                title={r.users.map((u) => (u === engine.me.uid ? 'You' : engine.getSnapshot().people.find((p) => p.uid === u)?.name || 'Someone')).join(', ')}
+                onClick={() => react(r.emoji)}>
+                <span aria-hidden="true">{r.emoji}</span> {r.count}
+              </button>
+            ))}
           </div>
         )}
+        {!readOnly && m.threadCount > 0 && (
+          <button type="button" className="thread-link" onClick={() => onThread(m)}><Icon name="thread" size={14} /> {m.threadCount} {m.threadCount === 1 ? 'reply' : 'replies'}</button>
+        )}
+        {m.mine && !m.deleted && !readOnly && <Receipt receipt={m.receipt} />}
       </div>
-      {!m.deleted && !editing && (
-        <div className="msg-actions" role="toolbar" aria-label="Message actions">
-          <button type="button" className="icon-btn sm" data-emoji-trigger onClick={() => setPicker((v) => !v)} aria-label="Add reaction" aria-expanded={picker}><Icon name="smile" size={16} /></button>
-          <button type="button" className="icon-btn sm" onClick={() => onReply(m)} aria-label="Reply"><Icon name="reply" size={16} /></button>
-          {own && <button type="button" className="icon-btn sm" onClick={startEdit} aria-label="Edit message" disabled={!m.message}><Icon name="edit" size={16} /></button>}
-          {own && <button type="button" className="icon-btn sm danger" onClick={() => onDelete(m)} aria-label="Delete message"><Icon name="trash" size={16} /></button>}
+      {!readOnly && !m.deleted && (
+        <div className="msg-tools" role="toolbar" aria-label="Message actions">
+          {QUICK_REACTIONS.slice(0, 3).map((e) => <button key={e} type="button" className="icon-btn emoji-btn" aria-label={`React ${e}`} onClick={() => react(e)}>{e}</button>)}
+          <span className="menu">
+            <button type="button" className="icon-btn" data-picker-trigger aria-label="Add reaction" aria-expanded={picker} onClick={() => setPicker((p) => !p)}><Icon name="smile" size={18} /></button>
+            {picker && <EmojiPicker label="Pick a reaction" anchor="side" onClose={() => setPicker(false)} onPick={(e) => { setPicker(false); react(e); }} />}
+          </span>
+          <button type="button" className="icon-btn" aria-label="Reply" onClick={() => onReply(m)}><Icon name="reply" size={18} /></button>
+          {!m.reply && <button type="button" className="icon-btn" aria-label="Open thread" onClick={() => onThread(m)}><Icon name="thread" size={18} /></button>}
+          <Menu label="More actions" items={menuItems} />
         </div>
       )}
-      {picker && <div className="msg-picker"><EmojiPicker quick onPick={pick} onClose={() => setPicker(false)} label="Pick a reaction" /></div>}
-    </li>
+    </article>
   );
 }
 
-export default memo(Message);
+export default memo(MessageBase, (a, b) => a.item.message === b.item.message && a.item.grouped === b.item.grouped && a.highlight === b.highlight && a.ctx === b.ctx && a.readOnly === b.readOnly);
