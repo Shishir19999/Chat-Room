@@ -11,6 +11,8 @@ export const STRATEGIES = [
 ];
 
 const MB = 1024 * 1024;
+// Public Nostr relays that accepted a WebSocket connection when last checked (dead ones only add console noise).
+const NOSTR_RELAYS = ['relay.aarpia.com', 'nostr.stakey.net', 'relay.bullishbounty.com', 'relay.degmods.com', 'relay.agentry.com', 'relay.kaleidoswap.com', 'relay.bitmacro.cloud', 'relay.nostrmap.net', 'relay.grigic.org', 'relay.nostr.blockhenge.com', 'relay.routstr.com'].map((h) => `wss://${h}`);
 // Size caps for what a peer may send us, per action (a stranger must not be able to push huge payloads).
 const CAPS = { op: 64 * 1024, eph: 16 * 1024, hist: { request: 4 * 1024, response: 3 * MB }, blob: { request: 1024, response: LIMITS.fileBytes + 4096 } };
 
@@ -112,7 +114,7 @@ export function createP2pTransport({
       return null;
     }
     if (stopped) return null;
-    const config = { appId: APP_ID, maxReceiveBytes: 8 * MB, ...(password ? { password } : {}) };
+    const config = { appId: APP_ID, maxReceiveBytes: 8 * MB, ...(password ? { password } : {}), ...(spec.name === 'nostr' ? { relayConfig: { urls: NOSTR_RELAYS } } : {}) };
     const room = mod.joinRoom(config, ws, {
       onJoinError: (details) => {
         lastError = password
